@@ -194,10 +194,15 @@ process SPLIT_IN_WINDOWS {
 
     echo "split_seq_into_windows pipe-header-v2" >&2
 
-    cp -L "${genome_file}" "${acc}.fasta"
+    GENOME_INPUT="${genome_file}"
+    GENOME_FOR_WINDOWS="${acc}.fasta"
+
+    if [ "\$GENOME_INPUT" != "\$GENOME_FOR_WINDOWS" ]; then
+        cp -L "\$GENOME_INPUT" "\$GENOME_FOR_WINDOWS"
+    fi
 
     python3 "${workflow.projectDir}/split_seq_into_windows.py" \
-        --input "${acc}.fasta" \
+        --input "\$GENOME_FOR_WINDOWS" \
         --format fasta \
         --w_size ${params.w_size} \
         --s_size ${params.s_size} \
