@@ -55,8 +55,8 @@ params.antismash_bin = '/Users/kian/grins/bin/antismash'
  */
 params.antismash_indir = ''
 
-process ANTISMASH5 {
-    label 'antismash5'
+process RUN_ANTISMASH {
+    label 'run_antismash'
     cpus params.antismash_cpus
     tag "$acc"
     stageInMode 'copy'
@@ -362,7 +362,7 @@ workflow {
 
     if (params.antismash_indir != null && params.antismash_indir.toString().trim() != '') {
         log.info "Using existing antiSMASH results from: ${params.antismash_indir}"
-        log.info "Skipping ANTISMASH5 process."
+        log.info "Skipping RUN_ANTISMASH process."
 
         existing_antismash_files_ch = genomes_ch.map { acc, genomefa ->
             def root = file(params.antismash_indir)
@@ -404,8 +404,8 @@ Make sure the antiSMASH file basename matches the FASTA basename in --indir.
         antismash_dir_ch = STAGE_EXISTING_ANTISMASH.out.antismash_dir
     }
     else {
-        ANTISMASH5(genomes_ch)
-        antismash_dir_ch = ANTISMASH5.out.antismash_dir
+        RUN_ANTISMASH(genomes_ch)
+        antismash_dir_ch = RUN_ANTISMASH.out.antismash_dir
     }
 
     ANTISMASH2GFF3(antismash_dir_ch)
