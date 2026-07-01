@@ -194,6 +194,8 @@ process SPLIT_IN_WINDOWS {
 
     echo "split_seq_into_windows pipe-header-v2" >&2
 
+    cp -L "${genome_file}" "${acc}.fasta"
+
     python3 "${workflow.projectDir}/split_seq_into_windows.py" \
         --input "${acc}.fasta" \
         --format fasta \
