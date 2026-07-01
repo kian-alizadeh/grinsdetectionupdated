@@ -16,6 +16,7 @@ nextflow.enable.dsl = 2
  *   - named process outputs with `emit`.
  *   - container/profile support through nextflow.config labels.
  *   - stageInMode 'copy' and cp -L for container-safe file staging.
+ *   - optional reuse of already generated antiSMASH output with --antismash_indir.
  */
 
 params.indir = 'genomes_fasta'
@@ -28,6 +29,31 @@ params.antismash_cpus = 8
 params.bowtie2_cpus = 1
 params.with_plots = 'yes'
 params.antismash_bin = '/Users/kian/grins/bin/antismash'
+
+/*
+ * Optional directory containing already completed antiSMASH outputs.
+ *
+ * Leave blank to run antiSMASH normally.
+ *
+ * Use this to skip antiSMASH:
+ *
+ *   --antismash_indir full_run/antismash
+ *
+ * For an input FASTA named:
+ *
+ *   genomes_fasta/sequence.fasta
+ *
+ * this expects either:
+ *
+ *   full_run/antismash/sequence/sequence.json
+ *   full_run/antismash/sequence/sequence.gbk
+ *
+ * or:
+ *
+ *   full_run/antismash/sequence.json
+ *   full_run/antismash/sequence.gbk
+ */
+params.antismash_indir = ''
 
 process ANTISMASH5 {
     label 'antismash5'
@@ -63,6 +89,38 @@ process ANTISMASH5 {
         --verbose \
         --genefinding-tool prodigal \
         "\$GENOME_FOR_ANTISMASH"
+    """
+}
+
+process STAGE_EXISTING_ANTISMASH {
+    label 'py3'
+    tag "$acc"
+    stageInMode 'copy'
+
+    input:
+    tuple val(acc), path(json_file), path(gbk_file)
+
+    output:
+    tuple val(acc), path('output'), emit: antismash_dir
+
+    script:
+    """
+    set -euo pipefail
+
+    mkdir -p output
+
+    cp -L "${json_file}" "output/${acc}.json"
+    cp -L "${gbk_file}" "output/${acc}.gbk"
+
+    if [[ ! -s "output/${acc}.json" ]]; then
+        echo "ERROR: Existing antiSMASH JSON file is missing or empty after staging: output/${acc}.json" >&2
+        exit 1
+    fi
+
+    if [[ ! -s "output/${acc}.gbk" ]]; then
+        echo "ERROR: Existing antiSMASH GenBank file is missing or empty after staging: output/${acc}.gbk" >&2
+        exit 1
+    fi
     """
 }
 
@@ -298,11 +356,60 @@ workflow {
             tuple(acc, genomefa)
         }
 
-    ANTISMASH5(genomes_ch)
     SPLIT_IN_WINDOWS(genomes_ch)
 
-    ANTISMASH2GFF3(ANTISMASH5.out.antismash_dir)
-    COLLECT_ANTISMASH_GBK(ANTISMASH5.out.antismash_dir)
+    def antismash_dir_ch
+
+    if (params.antismash_indir != null && params.antismash_indir.toString().trim() != '') {
+        log.info "Using existing antiSMASH results from: ${params.antismash_indir}"
+        log.info "Skipping ANTISMASH5 process."
+
+        existing_antismash_files_ch = genomes_ch.map { acc, genomefa ->
+            def root = file(params.antismash_indir)
+
+            if (!root.exists()) {
+                error "--antismash_indir does not exist: ${params.antismash_indir}"
+            }
+
+            def nested_json = file("${params.antismash_indir}/${acc}/${acc}.json")
+            def nested_gbk = file("${params.antismash_indir}/${acc}/${acc}.gbk")
+
+            def flat_json = file("${params.antismash_indir}/${acc}.json")
+            def flat_gbk = file("${params.antismash_indir}/${acc}.gbk")
+
+            if (nested_json.exists() && nested_gbk.exists()) {
+                tuple(acc, nested_json, nested_gbk)
+            }
+            else if (flat_json.exists() && flat_gbk.exists()) {
+                tuple(acc, flat_json, flat_gbk)
+            }
+            else {
+                error """
+Could not find existing antiSMASH files for genome '${acc}'.
+
+Expected one of these layouts:
+  ${params.antismash_indir}/${acc}/${acc}.json
+  ${params.antismash_indir}/${acc}/${acc}.gbk
+
+or:
+  ${params.antismash_indir}/${acc}.json
+  ${params.antismash_indir}/${acc}.gbk
+
+Make sure the antiSMASH file basename matches the FASTA basename in --indir.
+"""
+            }
+        }
+
+        STAGE_EXISTING_ANTISMASH(existing_antismash_files_ch)
+        antismash_dir_ch = STAGE_EXISTING_ANTISMASH.out.antismash_dir
+    }
+    else {
+        ANTISMASH5(genomes_ch)
+        antismash_dir_ch = ANTISMASH5.out.antismash_dir
+    }
+
+    ANTISMASH2GFF3(antismash_dir_ch)
+    COLLECT_ANTISMASH_GBK(antismash_dir_ch)
 
     BOWTIE2_ALIGN(SPLIT_IN_WINDOWS.out.windows)
     MERGE_BAM_WINDOWS(BOWTIE2_ALIGN.out.bam)
