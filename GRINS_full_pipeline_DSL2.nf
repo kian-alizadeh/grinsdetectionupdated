@@ -28,7 +28,7 @@ params.min_size = 500
 params.antismash_cpus = 8
 params.bowtie2_cpus = 1
 params.with_plots = 'yes'
-params.antismash_bin = '/Users/kian/grins/bin/antismash'
+params.antismash_bin = 'antismash'
 
 /*
  * Optional directory containing already completed antiSMASH outputs.
