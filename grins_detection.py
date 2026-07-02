@@ -7,6 +7,8 @@ from __future__ import annotations
 import argparse
 
 from grins_utils import (
+    STEP_SIZE,
+    WINDOW_SIZE,
     antismash_json_to_gff3,
     bam_to_duplicate_gff3,
     detect_grins_from_bowtie,
@@ -49,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bam_parser.add_argument("--input", required=True, help="BAM file from Bowtie2/Samtools")
     bam_parser.add_argument("--output", default="grins.gff3", help="Output GFF3 path")
-    bam_parser.add_argument("--w_size", type=int, default=150, help="Window size used during splitting")
+    bam_parser.add_argument("--w_size", type=int, default=WINDOW_SIZE, help="Window size used during splitting")
     bam_parser.add_argument("--min_size", type=int, default=0, help="Minimum duplicated-region size to write")
     bam_parser.set_defaults(func=run_bam_to_duplicates)
 
@@ -66,6 +68,8 @@ def build_parser() -> argparse.ArgumentParser:
     grins_parser.add_argument("--with_plots", default="no", help="Write skew plots: yes/no")
     grins_parser.add_argument("--plot_output", default="./output/plots", help="Plot output folder")
     grins_parser.add_argument("--summary_output", default="GRINS_detected_in_genomes_and_BGCs.txt", help="Summary table output file")
+    grins_parser.add_argument("--skew_w_size", type=int, default=WINDOW_SIZE, help="Window size for GC/TA skew calculations")
+    grins_parser.add_argument("--skew_s_size", type=int, default=STEP_SIZE, help="Step size for GC/TA skew calculations")
     grins_parser.set_defaults(func=run_detect_grins)
 
     return parser
@@ -104,6 +108,8 @@ def run_detect_grins(args: argparse.Namespace) -> None:
         plot_output=args.plot_output,
         with_plots=args.with_plots,
         summary_output=args.summary_output,
+        skew_window_size=args.skew_w_size,
+        skew_step_size=args.skew_s_size,
     )
 
 
