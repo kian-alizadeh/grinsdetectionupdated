@@ -10,13 +10,9 @@ nextflow.enable.dsl = 2
  *   2. manual asmash_genbanks symlink step
  *   3. GRINS_detection_from_BOWTIE.nf
  *
- * Main improvements:
- *   - DSL2 workflow/process calling syntax.
- *   - path/val tuple inputs instead of DSL1 `from` input clauses.
- *   - named process outputs with `emit`.
- *   - container/profile support through nextflow.config labels.
- *   - stageInMode 'copy' and cp -L for container-safe file staging.
- *   - optional reuse of already generated antiSMASH output with --antismash_indir.
+ * Python helper logic now lives in:
+ *   - grins_utils.py: reusable functions
+ *   - grins_detection.py: command-line subcommands used by this workflow
  */
 
 params.indir = 'genomes_fasta'
@@ -29,30 +25,6 @@ params.antismash_cpus = 8
 params.bowtie2_cpus = 1
 params.with_plots = 'yes'
 params.antismash_bin = 'antismash'
-
-/*
- * Optional directory containing already completed antiSMASH outputs.
- *
- * Leave blank to run antiSMASH normally.
- *
- * Use this to skip antiSMASH:
- *
- *   --antismash_indir full_run/antismash
- *
- * For an input FASTA named:
- *
- *   genomes_fasta/sequence.fasta
- *
- * this expects either:
- *
- *   full_run/antismash/sequence/sequence.json
- *   full_run/antismash/sequence/sequence.gbk
- *
- * or:
- *
- *   full_run/antismash/sequence.json
- *   full_run/antismash/sequence.gbk
- */
 params.antismash_indir = ''
 
 process RUN_ANTISMASH {
@@ -74,6 +46,13 @@ process RUN_ANTISMASH {
     script:
     """
     set -euo pipefail
+
+    if ! command -v "${params.antismash_bin}" >/dev/null 2>&1; then
+        echo "ERROR: antiSMASH executable not found: ${params.antismash_bin}" >&2
+        echo "Install antiSMASH, activate the correct environment, or pass --antismash_bin /path/to/antismash." >&2
+        echo "To skip antiSMASH and reuse existing outputs, pass --antismash_indir /path/to/antismash_results." >&2
+        exit 127
+    fi
 
     GENOME_INPUT="${genome_file}"
     GENOME_FOR_ANTISMASH="${acc}.fasta"
@@ -108,7 +87,6 @@ process STAGE_EXISTING_ANTISMASH {
     set -euo pipefail
 
     mkdir -p output
-
     cp -L "${json_file}" "output/${acc}.json"
     cp -L "${gbk_file}" "output/${acc}.gbk"
 
@@ -142,7 +120,7 @@ process ANTISMASH2GFF3 {
     """
     set -euo pipefail
 
-    python3 "${workflow.projectDir}/antismash2gff3.py" \
+    python3 "${workflow.projectDir}/grins_detection.py" antismash-to-gff3 \
         --input "${antismash_dir}/${acc}.json" \
         --output "${acc}.gff3"
     """
@@ -192,8 +170,6 @@ process SPLIT_IN_WINDOWS {
     """
     set -euo pipefail
 
-    echo "split_seq_into_windows pipe-header-v2" >&2
-
     GENOME_INPUT="${genome_file}"
     GENOME_FOR_WINDOWS="${acc}.fasta"
 
@@ -201,7 +177,7 @@ process SPLIT_IN_WINDOWS {
         cp -L "\$GENOME_INPUT" "\$GENOME_FOR_WINDOWS"
     fi
 
-    python3 "${workflow.projectDir}/split_seq_into_windows.py" \
+    python3 "${workflow.projectDir}/grins_detection.py" split-windows \
         --input "\$GENOME_FOR_WINDOWS" \
         --format fasta \
         --w_size ${params.w_size} \
@@ -264,7 +240,7 @@ process MERGE_BAM_WINDOWS {
     """
     set -euo pipefail
 
-    python3 "${workflow.projectDir}/produce_windows_from_bam.py" \
+    python3 "${workflow.projectDir}/grins_detection.py" bam-to-duplicates \
         --input "${bam}" \
         --output "${acc}.duplicated.gff3" \
         --w_size ${params.w_size} \
@@ -295,7 +271,7 @@ process INTERSECT_ASMASH_DUPS {
         exit 0
     fi
 
-    bedtools intersect -wo -a "${dup_gff3}" -b "${regions_gff3}" | \\
+    bedtools intersect -wo -a "${dup_gff3}" -b "${regions_gff3}" | \
     awk -F '\\t' 'BEGIN { OFS="\\t" } {
         gsub(/ID=region/, "Region=region", \$9);
         \$9 = \$9 ";" \$18;
@@ -338,7 +314,7 @@ process GRINSPRED {
     cp -L "${gbk_file}" "gbk/${genome}.gbk"
     cp -L "${dup_gff3}" "dup/${genome}.duplicated.gff3"
 
-    python3 "${workflow.projectDir}/GRINS_detection_from_BOWTIE.py" \
+    python3 "${workflow.projectDir}/grins_detection.py" detect-grins \
         --seq_input gbk \
         --dupl_input dup \
         --seq_output output/genomes_GRINS \
@@ -356,10 +332,10 @@ workflow {
 
     genomes_ch = Channel
         .fromPath("${params.indir}/*", type: 'file', checkIfExists: true)
-        .filter { it.name ==~ /.+\.(fa|fasta|fna|fas)$/ }
-        .ifEmpty { error "No FASTA files found in ${params.indir}. Expected .fa, .fasta, .fna, or .fas files." }
+        .filter { genomefa -> genomefa.name ==~ /(?i).+\.(fa|fasta|fna|fas)$/ }
+        .ifEmpty { error "No FASTA files found in ${params.indir}. Expected .fa, .fasta, .fna, .fas, or uppercase versions of those extensions." }
         .map { genomefa ->
-            def acc = genomefa.name.replaceFirst(/\.(fa|fasta|fna|fas)$/, '')
+            def acc = genomefa.name.replaceFirst(/(?i)\.(fa|fasta|fna|fas)$/, '')
             tuple(acc, genomefa)
         }
 
@@ -373,14 +349,12 @@ workflow {
 
         existing_antismash_files_ch = genomes_ch.map { acc, genomefa ->
             def root = file(params.antismash_indir)
-
             if (!root.exists()) {
                 error "--antismash_indir does not exist: ${params.antismash_indir}"
             }
 
             def nested_json = file("${params.antismash_indir}/${acc}/${acc}.json")
             def nested_gbk = file("${params.antismash_indir}/${acc}/${acc}.gbk")
-
             def flat_json = file("${params.antismash_indir}/${acc}.json")
             def flat_gbk = file("${params.antismash_indir}/${acc}.gbk")
 
