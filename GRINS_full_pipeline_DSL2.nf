@@ -23,6 +23,8 @@ params.s_size = 30
 params.min_size = 500
 params.antismash_cpus = 8
 params.bowtie2_cpus = 1
+params.antismash_max_forks = 2
+params.bowtie2_max_forks = 2
 params.with_plots = 'yes'
 params.antismash_bin = 'antismash'
 params.antismash_indir = ''
@@ -30,6 +32,7 @@ params.antismash_indir = ''
 process RUN_ANTISMASH {
     label 'run_antismash'
     cpus params.antismash_cpus
+    maxForks params.antismash_max_forks
     tag "$acc"
     stageInMode 'copy'
 
@@ -189,6 +192,7 @@ process SPLIT_IN_WINDOWS {
 process BOWTIE2_ALIGN {
     label 'bowtie2'
     cpus params.bowtie2_cpus
+    maxForks params.bowtie2_max_forks
     tag "$acc"
     stageInMode 'copy'
 
