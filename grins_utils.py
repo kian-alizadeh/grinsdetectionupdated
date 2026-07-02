@@ -14,6 +14,17 @@ import numpy as np
 from Bio import SeqIO
 from Bio.SeqFeature import FeatureLocation, SeqFeature
 
+# Default settings used by the original GRINS detection workflow.
+# Keep these centralized so the window and step sizes are not hidden in plotting
+# or BAM-parsing code.
+WINDOW_SIZE = 150
+STEP_SIZE = 30
+MIN_WINDOW_SIZE = 50
+PLOT_CHUNK_SIZE = 100_000
+FLANK_SIZE = 300
+MIN_GRINS_SIZE = 500
+GC_SKEW_THRESHOLD = 0.15
+TA_SKEW_THRESHOLD = 0.15
 
 GRINS_SUMMARY_HEADER = [
     "Genome",
@@ -73,10 +84,10 @@ def use_plots(value: str | bool) -> bool:
 def split_sequence_into_windows(
     input_path: str | Path,
     input_format: str = "fasta",
-    window_size: int = 150,
-    step_size: int = 30,
+    window_size: int = WINDOW_SIZE,
+    step_size: int = STEP_SIZE,
     output_path: Optional[str | Path] = None,
-    min_window_size: int = 50,
+    min_window_size: int = MIN_WINDOW_SIZE,
 ) -> Path:
     """Split sequence records into overlapping windows for Bowtie2 alignment.
 
@@ -98,6 +109,7 @@ def split_sequence_into_windows(
                 if (end - start) < min_window_size:
                     break
 
+                # The query name is intentionally machine-readable for BAM parsing.
                 window = record[start:end]
                 window.id = f"{record.id}|{start}|{end}"
                 window.name = window.id
@@ -151,6 +163,8 @@ def antismash_json_to_gff3(input_json: str | Path, output_gff3: str | Path = "")
                     continue
 
                 n_regions += 1
+                # antiSMASH reports region coordinates in JSON; convert them once here
+                # so downstream steps can work with standard GFF3 intervals.
                 start, end = _parse_antismash_location(feature.get("location", ""))
                 qualifiers = feature.get("qualifiers", {})
                 region_number = qualifiers.get("region_number", [str(n_regions)])[0]
@@ -232,7 +246,7 @@ class WindowCollection:
 BamWindow = Tuple[str, int, int, str, int, int, int]
 
 
-def find_bam_windows(input_bam: str | Path, min_alignment_size: int = 150) -> List[BamWindow]:
+def find_bam_windows(input_bam: str | Path, min_alignment_size: int = WINDOW_SIZE) -> List[BamWindow]:
     """Read a BAM file and collect non-self duplicated window alignments."""
     try:
         import pysam
@@ -245,6 +259,7 @@ def find_bam_windows(input_bam: str | Path, min_alignment_size: int = 150) -> Li
             if read.is_unmapped or read.reference_name is None:
                 continue
 
+            # split_sequence_into_windows writes query names as record|start|end.
             parts = read.query_name.split("|")
             if len(parts) != 3:
                 raise ValueError(
@@ -260,6 +275,8 @@ def find_bam_windows(input_bam: str | Path, min_alignment_size: int = 150) -> Li
             # Discard exact self-maps but keep matches to other locations/records.
             if alignment_length >= min_alignment_size and reference_start > 0:
                 if query_ref != read.reference_name or reference_start != query_start:
+                    # Store both the original window and the mapped target interval so
+                    # duplicated regions can be merged on both sides of the match.
                     bam_windows.append((
                         query_ref,
                         query_start,
@@ -317,7 +334,7 @@ def write_duplicate_gff3(
 def bam_to_duplicate_gff3(
     input_bam: str | Path,
     output_gff3: str | Path,
-    window_size: int = 150,
+    window_size: int = WINDOW_SIZE,
     min_size: int = 0,
 ) -> Path:
     bam_windows = find_bam_windows(input_bam, min_alignment_size=window_size)
@@ -330,7 +347,7 @@ def bam_to_duplicate_gff3(
 # ---------------------------------------------------------------------------
 
 
-def gc_skew(input_dna: str, window: int = 150, step: int = 30) -> List[float]:
+def gc_skew(input_dna: str, window: int = WINDOW_SIZE, step: int = STEP_SIZE) -> List[float]:
     sequence = str(input_dna).upper()
     values = []
     for start in range(0, len(sequence) - window, step):
@@ -341,7 +358,7 @@ def gc_skew(input_dna: str, window: int = 150, step: int = 30) -> List[float]:
     return values
 
 
-def ta_skew(input_dna: str, window: int = 150, step: int = 30) -> List[float]:
+def ta_skew(input_dna: str, window: int = WINDOW_SIZE, step: int = STEP_SIZE) -> List[float]:
     sequence = str(input_dna).upper()
     values = []
     for start in range(0, len(sequence) - window, step):
@@ -352,7 +369,7 @@ def ta_skew(input_dna: str, window: int = 150, step: int = 30) -> List[float]:
     return values
 
 
-def abs_skew_means(record, start: int, end: int, window: int = 150, step: int = 30) -> Tuple[float, float]:
+def abs_skew_means(record, start: int, end: int, window: int = WINDOW_SIZE, step: int = STEP_SIZE) -> Tuple[float, float]:
     sequence = str(record.seq[start:end]).upper()
     gc_values = []
     ta_values = []
@@ -382,13 +399,14 @@ def plot_grins_region(
     duplicated_ends: Sequence[int],
     grins_starts: Sequence[int],
     grins_ends: Sequence[int],
+    step_size: int = STEP_SIZE,
 ) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.patches as patches
     import matplotlib.pyplot as plt
 
-    x_values = np.arange(start, start + len(gc_values) * 30, 30)
+    x_values = np.arange(start, start + len(gc_values) * step_size, step_size)
     _fig, ax1 = plt.subplots(figsize=(10, 4))
     ax1.set_ylim(-1, 1)
     ax1.set_xlim(start, end)
@@ -449,6 +467,8 @@ def find_sequence_file(seq_dir: str | Path, assembly: str) -> Path:
         if candidate.exists():
             return candidate
 
+    # Fall back to the original script behavior: substring matching.
+    # Exact names above are preferred to avoid accidental matches when possible.
     matches = [p for p in files if assembly in p.name]
     if not matches:
         raise FileNotFoundError(f"Could not find a GenBank file for assembly {assembly!r} in {seq_dir}")
@@ -530,9 +550,12 @@ def _plot_record_windows(
     plot_output: str | Path,
     duplicate_locations: Sequence[Tuple[int, int]],
     grins_locations: Sequence[Tuple[int, int]],
+    skew_window_size: int = WINDOW_SIZE,
+    skew_step_size: int = STEP_SIZE,
+    plot_chunk_size: int = PLOT_CHUNK_SIZE,
 ) -> None:
-    for start in range(0, len(record.seq), 100000):
-        end = start + 100000
+    for start in range(0, len(record.seq), plot_chunk_size):
+        end = start + plot_chunk_size
 
         dup_starts: List[int] = []
         dup_ends: List[int] = []
@@ -554,12 +577,13 @@ def _plot_record_windows(
             record.id,
             start,
             end,
-            gc_skew(str(record.seq[start:end])),
-            ta_skew(str(record.seq[start:end])),
+            gc_skew(str(record.seq[start:end]), window=skew_window_size, step=skew_step_size),
+            ta_skew(str(record.seq[start:end]), window=skew_window_size, step=skew_step_size),
             dup_starts,
             dup_ends,
             grins_starts,
             grins_ends,
+            step_size=skew_step_size,
         )
 
 
@@ -572,10 +596,13 @@ def detect_grins_from_bowtie(
     plot_output: str | Path = "./output/plots",
     with_plots: str | bool = "no",
     summary_output: str | Path = "GRINS_detected_in_genomes_and_BGCs.txt",
-    flank_size: int = 300,
-    min_grins_size: int = 500,
-    gc_threshold: float = 0.15,
-    ta_threshold: float = 0.15,
+    flank_size: int = FLANK_SIZE,
+    min_grins_size: int = MIN_GRINS_SIZE,
+    gc_threshold: float = GC_SKEW_THRESHOLD,
+    ta_threshold: float = TA_SKEW_THRESHOLD,
+    skew_window_size: int = WINDOW_SIZE,
+    skew_step_size: int = STEP_SIZE,
+    plot_chunk_size: int = PLOT_CHUNK_SIZE,
 ) -> Path:
     """Detect GRINS from antiSMASH GenBank files and duplicated-region GFF3 files."""
     seq_input = Path(seq_input)
@@ -621,6 +648,7 @@ def detect_grins_from_bowtie(
                     record_features = record.features
                     accession = strip_version(record.id)
 
+                    # Count all antiSMASH BGC region annotations before testing GRINS.
                     for feature in record_features:
                         if feature.type != "region":
                             continue
@@ -633,6 +661,8 @@ def detect_grins_from_bowtie(
                     grins_locations: List[Tuple[int, int]] = []
 
                     for dup_start, dup_end in duplicate_locations:
+                        # Every duplicated interval is written to the annotated GenBank,
+                        # but only long, skewed intervals are promoted to GRINS.
                         record.features.append(
                             SeqFeature(FeatureLocation(start=dup_start, end=dup_end), type="Duplication")
                         )
@@ -640,7 +670,13 @@ def detect_grins_from_bowtie(
                         if dup_end - dup_start < min_grins_size:
                             continue
 
-                        mean_gc_skew, mean_ta_skew = abs_skew_means(record, dup_start, dup_end)
+                        mean_gc_skew, mean_ta_skew = abs_skew_means(
+                            record,
+                            dup_start,
+                            dup_end,
+                            window=skew_window_size,
+                            step=skew_step_size,
+                        )
                         if mean_gc_skew < gc_threshold or mean_ta_skew < ta_threshold:
                             continue
 
@@ -652,6 +688,8 @@ def detect_grins_from_bowtie(
                         grins_end = int(dup_end)
                         grins_locations.append((grins_start, grins_end))
 
+                        # A GRINS is counted as BGC-associated if it lies within
+                        # a BGC region plus the original workflow's flanking window.
                         in_bgc = False
                         current_bgc_type = ""
                         for feature in record_features:
@@ -665,6 +703,8 @@ def detect_grins_from_bowtie(
                                 _update_grins_bgc_stats(stats, current_bgc_type)
                                 break
 
+                        # The CDS check mirrors the original script and ignores extremely
+                        # large CDS-like features that are usually annotation artifacts.
                         in_cds = False
                         current_cds = None
                         for feature in record_features:
@@ -708,7 +748,16 @@ def detect_grins_from_bowtie(
                     SeqIO.write(record, annotated_handle, "genbank")
 
                     if make_plots:
-                        _plot_record_windows(record, assembly, plot_output, duplicate_locations, grins_locations)
+                        _plot_record_windows(
+                            record,
+                            assembly,
+                            plot_output,
+                            duplicate_locations,
+                            grins_locations,
+                            skew_window_size=skew_window_size,
+                            skew_step_size=skew_step_size,
+                            plot_chunk_size=plot_chunk_size,
+                        )
 
             summary_values = [
                 assembly,
