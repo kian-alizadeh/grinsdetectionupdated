@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from Bio import SeqIO
@@ -196,10 +196,52 @@ def antismash_json_to_gff3(input_json: str | Path, output_gff3: str | Path = "")
 # ---------------------------------------------------------------------------
 
 
+class DisjointSet:
+    """Small union-find helper used to keep match-connected regions together."""
+
+    def __init__(self):
+        self.parent: Dict[int, int] = {}
+        self.rank: Dict[int, int] = {}
+
+    def make(self, item: int) -> None:
+        if item not in self.parent:
+            self.parent[item] = item
+            self.rank[item] = 0
+
+    def find(self, item: int) -> int:
+        self.make(item)
+        if self.parent[item] != item:
+            self.parent[item] = self.find(self.parent[item])
+        return self.parent[item]
+
+    def union(self, first: int, second: int) -> int:
+        first_root = self.find(first)
+        second_root = self.find(second)
+        if first_root == second_root:
+            return first_root
+
+        if self.rank[first_root] < self.rank[second_root]:
+            first_root, second_root = second_root, first_root
+        self.parent[second_root] = first_root
+        if self.rank[first_root] == self.rank[second_root]:
+            self.rank[first_root] += 1
+        return first_root
+
+    def union_many(self, items: Iterable[int]) -> Optional[int]:
+        item_list = list(items)
+        if not item_list:
+            return None
+        root = item_list[0]
+        self.make(root)
+        for item in item_list[1:]:
+            root = self.union(root, item)
+        return self.find(root)
+
+
 class Window:
     """A genomic interval represented with 0-based start and 1-based-style end."""
 
-    def __init__(self, start: int, end: int):
+    def __init__(self, start: int, end: int, group_ids: Optional[Iterable[int]] = None):
         if not isinstance(start, int) or not isinstance(end, int):
             raise ValueError("start and end must be integers.")
         if start < 0 or end < 0:
@@ -208,13 +250,15 @@ class Window:
             raise ValueError("start cannot be greater than end.")
         self.start = start
         self.end = end
+        self.group_ids: Set[int] = set(group_ids or [])
 
 
 class WindowCollection:
-    """Merge overlapping windows for one sequence record."""
+    """Merge overlapping windows for one sequence record while preserving match identity."""
 
-    def __init__(self):
+    def __init__(self, groups: Optional[DisjointSet] = None):
         self.windows: List[Window] = []
+        self.groups = groups
 
     def find_overlaps(self, window: Window) -> List[int]:
         overlaps = []
@@ -235,15 +279,48 @@ class WindowCollection:
 
         start = window.start
         end = window.end
+        group_ids = set(window.group_ids)
         for idx in overlaps:
             start = min(start, self.windows[idx].start)
             end = max(end, self.windows[idx].end)
+            group_ids.update(self.windows[idx].group_ids)
+
+        if self.groups is not None:
+            self.groups.union_many(group_ids)
 
         self.remove_windows(overlaps)
-        self.add_window(Window(start, end))
+        self.add_window(Window(start, end, group_ids))
+
+
+class DuplicateRegion(NamedTuple):
+    start: int
+    end: int
+    dup_id: str
+    dup_group_id: str
 
 
 BamWindow = Tuple[str, int, int, str, int, int, int]
+
+
+def _parse_gff3_attributes(attributes: str) -> Dict[str, str]:
+    parsed: Dict[str, str] = {}
+    for item in attributes.strip().split(";"):
+        if not item:
+            continue
+        if "=" not in item:
+            parsed[item] = ""
+            continue
+        key, value = item.split("=", 1)
+        parsed[key] = value
+    return parsed
+
+
+def _format_gff3_attributes(attributes: Dict[str, str]) -> str:
+    return ";".join(
+        f"{key}={value}"
+        for key, value in attributes.items()
+        if value is not None and value != ""
+    )
 
 
 def find_bam_windows(input_bam: str | Path, min_alignment_size: int = WINDOW_SIZE) -> List[BamWindow]:
@@ -290,30 +367,69 @@ def find_bam_windows(input_bam: str | Path, min_alignment_size: int = WINDOW_SIZ
     return bam_windows
 
 
-def merge_bam_windows(bam_windows: Iterable[BamWindow]) -> Dict[str, WindowCollection]:
-    """Merge query and target intervals by sequence record."""
+def merge_bam_windows(bam_windows: Iterable[BamWindow]) -> Tuple[Dict[str, WindowCollection], DisjointSet]:
+    """Merge query and target intervals by sequence record and keep connected match groups."""
     merged: Dict[str, WindowCollection] = {}
-    for query_ref, query_start, query_end, target_ref, target_start, target_end, _mapq in bam_windows:
-        merged.setdefault(query_ref, WindowCollection()).add_window(Window(query_start, query_end))
-        merged.setdefault(target_ref, WindowCollection()).add_window(Window(target_start, target_end))
-    return merged
+    groups = DisjointSet()
+
+    for match_id, (query_ref, query_start, query_end, target_ref, target_start, target_end, _mapq) in enumerate(bam_windows, start=1):
+        groups.make(match_id)
+        merged.setdefault(query_ref, WindowCollection(groups)).add_window(
+            Window(query_start, query_end, group_ids=[match_id])
+        )
+        merged.setdefault(target_ref, WindowCollection(groups)).add_window(
+            Window(target_start, target_end, group_ids=[match_id])
+        )
+
+    return merged, groups
+
+
+def _window_group_root(window: Window, groups: DisjointSet) -> Optional[int]:
+    roots = {groups.find(group_id) for group_id in window.group_ids}
+    if not roots:
+        return None
+    return groups.union_many(roots)
+
+
+def _assign_duplicate_group_labels(
+    windows_by_record: Dict[str, WindowCollection],
+    groups: DisjointSet,
+    min_size: int = 0,
+) -> Dict[int, str]:
+    first_locations: Dict[int, Tuple[str, int, int]] = {}
+    for record_id in sorted(windows_by_record):
+        for window in sorted(windows_by_record[record_id].windows, key=lambda w: (w.start, w.end)):
+            if (window.end - window.start) < min_size:
+                continue
+            root = _window_group_root(window, groups)
+            if root is None:
+                continue
+            first_locations.setdefault(root, (record_id, window.start, window.end))
+
+    sorted_roots = sorted(first_locations, key=lambda root: first_locations[root])
+    return {root: f"dup_group_{idx}" for idx, root in enumerate(sorted_roots, start=1)}
 
 
 def write_duplicate_gff3(
     windows_by_record: Dict[str, WindowCollection],
+    groups: DisjointSet,
     output_gff3: str | Path,
     min_size: int = 0,
 ) -> Path:
-    """Write merged duplicated regions as GFF3."""
+    """Write merged duplicated regions as GFF3, including connected duplicate-group IDs."""
     output_gff3 = Path(output_gff3)
+    group_labels = _assign_duplicate_group_labels(windows_by_record, groups, min_size=min_size)
     n_written = 0
     with output_gff3.open("w") as out_handle:
         out_handle.write("##gff-version 3\n")
         for record_id in sorted(windows_by_record):
-            for window in windows_by_record[record_id].windows:
+            for window in sorted(windows_by_record[record_id].windows, key=lambda w: (w.start, w.end)):
                 if (window.end - window.start) < min_size:
                     continue
                 n_written += 1
+                root = _window_group_root(window, groups)
+                dup_group_id = group_labels.get(root, f"dup_group_{n_written}")
+                dup_id = f"dup_{n_written}"
                 row = [
                     record_id,
                     "bowtie2",
@@ -323,11 +439,15 @@ def write_duplicate_gff3(
                     ".",
                     "+",
                     ".",
-                    f"ID=dup_{n_written}",
+                    _format_gff3_attributes({
+                        "ID": dup_id,
+                        "Name": dup_group_id,
+                        "dup_group_id": dup_group_id,
+                    }),
                 ]
                 out_handle.write("\t".join(row) + "\n")
 
-    print(f"Wrote {n_written} duplicated regions.")
+    print(f"Wrote {n_written} duplicated regions in {len(group_labels)} duplicate groups.")
     return output_gff3
 
 
@@ -338,8 +458,8 @@ def bam_to_duplicate_gff3(
     min_size: int = 0,
 ) -> Path:
     bam_windows = find_bam_windows(input_bam, min_alignment_size=window_size)
-    merged_windows = merge_bam_windows(bam_windows)
-    return write_duplicate_gff3(merged_windows, output_gff3, min_size=min_size)
+    merged_windows, groups = merge_bam_windows(bam_windows)
+    return write_duplicate_gff3(merged_windows, groups, output_gff3, min_size=min_size)
 
 
 # ---------------------------------------------------------------------------
@@ -435,8 +555,8 @@ def plot_grins_region(
     plt.close("all")
 
 
-def read_duplication_locations(dup_gff3: str | Path) -> Tuple[Dict[str, List[Tuple[int, int]]], int]:
-    locations: Dict[str, List[Tuple[int, int]]] = {}
+def read_duplication_locations(dup_gff3: str | Path) -> Tuple[Dict[str, List[DuplicateRegion]], int]:
+    locations: Dict[str, List[DuplicateRegion]] = {}
     n_dups = 0
     with Path(dup_gff3).open("r") as in_handle:
         for line in in_handle:
@@ -445,11 +565,17 @@ def read_duplication_locations(dup_gff3: str | Path) -> Tuple[Dict[str, List[Tup
             fields = line.rstrip("\n").split("\t")
             if len(fields) < 5:
                 continue
+
+            n_dups += 1
             accession = strip_version(fields[0])
             start = int(fields[3])
             end = int(fields[4])
-            locations.setdefault(accession, []).append((start, end))
-            n_dups += 1
+            attributes = _parse_gff3_attributes(fields[8]) if len(fields) > 8 else {}
+            dup_id = attributes.get("ID", f"dup_{n_dups}")
+            # Older duplicated GFF3 files will not have dup_group_id. In that case,
+            # keep them readable by treating each duplicate as its own group.
+            dup_group_id = attributes.get("dup_group_id", attributes.get("Name", dup_id))
+            locations.setdefault(accession, []).append(DuplicateRegion(start, end, dup_id, dup_group_id))
     return locations, n_dups
 
 
@@ -633,14 +759,20 @@ def detect_grins_from_bowtie(
             seq_file = find_sequence_file(seq_input, assembly)
             records = SeqIO.parse(str(seq_file), "gb")
 
+            # Keep GRINS identities local to one assembly/genome.
+            # Duplicate groups come from the BAM-derived GFF3; only groups that pass
+            # the final GRINS filters receive a GRINS_* label.
+            grins_id_by_dup_group: Dict[str, str] = {}
+            grins_part_counts: Dict[str, int] = {}
+
             with (seq_output / f"{assembly}.GRINS.gbk").open("w") as annotated_handle, \
                  (grins_bgc_output / f"{assembly}.GRINS_BGC.gff3").open("w") as grins_bgc_handle, \
                  (grins_output / f"{assembly}.GRINS_CDS.gff3").open("w") as grins_cds_handle, \
                  (grins_output / f"{assembly}.GRINS.gff3").open("w") as grins_handle:
 
-                grins_bgc_handle.write("\t".join(["Record", "GRINS start", "GRINS end", "BGC"]) + "\n")
-                grins_cds_handle.write("\t".join(["Record", "GRINS start", "GRINS end", "Locus", "CDS name"]) + "\n")
-                grins_handle.write("\t".join(["Record", "GRINS start", "GRINS end"]) + "\n")
+                grins_bgc_handle.write("##gff-version 3\n")
+                grins_cds_handle.write("##gff-version 3\n")
+                grins_handle.write("##gff-version 3\n")
 
                 for record in records:
                     stats["length_genome"] += len(record.seq)
@@ -657,14 +789,27 @@ def detect_grins_from_bowtie(
                         bgc_type = first_qualifier(feature, "product", "unknown")
                         _update_bgc_stats(stats, bgc_type, bgc_end - bgc_start)
 
-                    duplicate_locations = duplicate_locations_by_record.get(accession, [])
+                    duplicate_regions = duplicate_locations_by_record.get(accession, [])
+                    duplicate_locations = [(dup.start, dup.end) for dup in duplicate_regions]
                     grins_locations: List[Tuple[int, int]] = []
 
-                    for dup_start, dup_end in duplicate_locations:
+                    for duplicate_region in duplicate_regions:
+                        dup_start = duplicate_region.start
+                        dup_end = duplicate_region.end
+                        dup_id = duplicate_region.dup_id
+                        dup_group_id = duplicate_region.dup_group_id
                         # Every duplicated interval is written to the annotated GenBank,
                         # but only long, skewed intervals are promoted to GRINS.
                         record.features.append(
-                            SeqFeature(FeatureLocation(start=dup_start, end=dup_end), type="Duplication")
+                            SeqFeature(
+                                FeatureLocation(start=dup_start, end=dup_end),
+                                type="Duplication",
+                                qualifiers={
+                                    "label": [dup_group_id],
+                                    "dup_id": [dup_id],
+                                    "dup_group_id": [dup_group_id],
+                                },
+                            )
                         )
 
                         if dup_end - dup_start < min_grins_size:
@@ -681,8 +826,25 @@ def detect_grins_from_bowtie(
                             continue
 
                         stats["n_GRINS_total"] += 1
+                        if dup_group_id not in grins_id_by_dup_group:
+                            grins_id_by_dup_group[dup_group_id] = f"GRINS_{len(grins_id_by_dup_group) + 1}"
+                        grins_id = grins_id_by_dup_group[dup_group_id]
+                        grins_part_counts[grins_id] = grins_part_counts.get(grins_id, 0) + 1
+                        grins_feature_id = f"{grins_id}_part_{grins_part_counts[grins_id]}"
+
                         record.features.append(
-                            SeqFeature(FeatureLocation(start=dup_start, end=dup_end), type="GRINS")
+                            SeqFeature(
+                                FeatureLocation(start=dup_start, end=dup_end),
+                                type="GRINS",
+                                qualifiers={
+                                    "label": [grins_id],
+                                    "Name": [grins_id],
+                                    "grins_id": [grins_id],
+                                    "grins_feature_id": [grins_feature_id],
+                                    "dup_id": [dup_id],
+                                    "dup_group_id": [dup_group_id],
+                                },
+                            )
                         )
                         grins_start = int(dup_start)
                         grins_end = int(dup_end)
@@ -721,18 +883,32 @@ def detect_grins_from_bowtie(
                                 stats["n_GRINS_CDS"] += 1
                                 break
 
+                        grins_attributes = {
+                            "ID": grins_feature_id,
+                            "Name": grins_id,
+                            "grins_id": grins_id,
+                            "dup_id": dup_id,
+                            "dup_group_id": dup_group_id,
+                        }
                         grins_handle.write("\t".join([
-                            record.id, "GRINSdetect", "GRINS", str(grins_start), str(grins_end), ".", "+", ".", ""
+                            record.id, "GRINSdetect", "GRINS", str(grins_start), str(grins_end), ".", "+", ".",
+                            _format_gff3_attributes(grins_attributes),
                         ]) + "\n")
 
                         if in_bgc:
+                            bgc_attributes = dict(grins_attributes)
+                            bgc_attributes["BGC"] = current_bgc_type
                             grins_bgc_handle.write("\t".join([
-                                record.id, "GRINSdetect", "GRINS", str(grins_start), str(grins_end), ".", "+", ".", current_bgc_type
+                                record.id, "GRINSdetect", "GRINS", str(grins_start), str(grins_end), ".", "+", ".",
+                                _format_gff3_attributes(bgc_attributes),
                             ]) + "\n")
 
                         if in_cds and current_cds is not None:
                             locus_tag = first_qualifier(current_cds, "locus_tag", "N/a")
                             gene_function = first_qualifier(current_cds, "gene_functions", "N/a")
+                            cds_attributes = dict(grins_attributes)
+                            cds_attributes["locus_tag"] = locus_tag
+                            cds_attributes["gene_function"] = gene_function
                             grins_cds_handle.write("\t".join([
                                 record.id,
                                 "GRINSdetect",
@@ -742,7 +918,7 @@ def detect_grins_from_bowtie(
                                 ".",
                                 "+",
                                 ".",
-                                f"locus_tag={locus_tag},gene_function={gene_function}",
+                                _format_gff3_attributes(cds_attributes),
                             ]) + "\n")
 
                     SeqIO.write(record, annotated_handle, "genbank")
